@@ -4,7 +4,8 @@
 
 import pytest
 
-from vllm import LLM
+from vllm import LLM, SamplingParams
+from vllm.inputs import TokensPrompt
 from vllm.platforms import current_platform
 
 from ..models.utils import dummy_hf_overrides
@@ -57,3 +58,42 @@ def test_v2_sampler_warmup_rocm(monkeypatch, tmp_path):
     monkeypatch.setenv("VLLM_CACHE_ROOT", str(tmp_path / "vllm"))
     monkeypatch.setenv("TORCHINDUCTOR_CACHE_DIR", str(tmp_path / "inductor"))
     _run_rocm_shape_battery()
+
+
+@create_new_process_for_each_test("spawn")
+def _run_aiter_fa_extend() -> None:
+    llm = LLM(
+        "Qwen/Qwen3-0.6B",
+        max_model_len=2048,
+        max_num_seqs=8,
+        gpu_memory_utilization=0.03,
+        kv_cache_memory_bytes=256 * 1024 * 1024,
+        load_format="dummy",
+        hf_overrides=dummy_hf_overrides,
+        attention_config={"backend": "ROCM_AITER_FA"},
+        enable_prefix_caching=True,
+        jit_monitor_mode="error",
+    )
+    try:
+        params = SamplingParams(temperature=0.0, max_tokens=1)
+        prompt = list(range(1, 257))
+        llm.generate(TokensPrompt(prompt_token_ids=prompt), params)
+        # The cached prefix makes these extends; their lengths cover both
+        # integer specializations of the Triton kernels on that path.
+        for extra in (17, 32):
+            tokens = prompt + list(range(300, 300 + extra))
+            llm.generate(TokensPrompt(prompt_token_ids=tokens), params)
+    finally:
+        llm.llm_engine.engine_core.shutdown(timeout=30)
+
+
+def test_aiter_fa_extend_warmup_rocm(monkeypatch, tmp_path):
+    """A prefix-cache hit runs ROCM_AITER_FA's extend path, which startup must
+    have compiled."""
+    monkeypatch.setenv("VLLM_ROCM_USE_AITER", "0")
+    monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+    monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+    monkeypatch.setenv("TRITON_CACHE_DIR", str(tmp_path / "triton"))
+    monkeypatch.setenv("VLLM_CACHE_ROOT", str(tmp_path / "vllm"))
+    monkeypatch.setenv("TORCHINDUCTOR_CACHE_DIR", str(tmp_path / "inductor"))
+    _run_aiter_fa_extend()
